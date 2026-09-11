@@ -39,6 +39,8 @@ from anemoi.inference.config.run import RunConfiguration
 from anemoi.inference.runners import create_runner
 from anemoi.models.distributed.shapes import get_shard_shapes
 
+import forecast_model
+
 
 class AIFSState:
     """Thin wrapper whose `.state` attribute *is* the packed
@@ -58,8 +60,19 @@ class AIFSState:
         return AIFSState(self.state, self.date)
 
 
-class AIFSModel:
-    """Wraps a loaded AIFS-single-2.0 checkpoint for differentiable rollouts."""
+class AIFSModel(forecast_model.LatentForecastModel):
+    """Wraps a loaded AIFS-single-2.0 checkpoint for differentiable rollouts.
+
+    Implements `forecast_model.LatentForecastModel` -- see that module for
+    the formal contract this satisfies (and which parts of the solver core
+    each method backs). `model.runner` stays a public, undeclared escape
+    hatch used only by aifs_ic.py's IC-fetching glue (`build_input_state`/
+    `read_single_date_fields` need `runner.variables`, `runner.checkpoint`,
+    `GribFileInput(runner, ...)`, `runner._combine_states` -- real anemoi-
+    internal machinery too deep to usefully wrap behind 2-3 generic methods)
+    -- see forecast_model.InitialConditionProvider's docstring for why that
+    boundary is deliberately left unformalized for now.
+    """
 
     def __init__(self, checkpoint_path: str, config_path: str, device: str = "cuda"):
         """
@@ -102,16 +115,15 @@ class AIFSModel:
             p.requires_grad_(False)
 
         self.checkpoint = self.runner.checkpoint
-        self.device = self.runner.device
+        self._device = self.runner.device
         self.interface = self.runner.model  # AnemoiModelInterface
         self.multi_step = self.interface.multi_step
-        self.timestep: datetime.timedelta = self.checkpoint.timestep
+        self._timestep: datetime.timedelta = self.checkpoint.timestep
 
         self.var_to_idx = self.checkpoint.variable_to_input_tensor_index
         self.idx_to_var = self.checkpoint.output_tensor_index_to_variable
-        self.lats = np.asarray(self.checkpoint.latitudes)
-        self.lons = np.asarray(self.checkpoint.longitudes)
-        self.n_points = self.lats.size
+        self._lats = np.asarray(self.checkpoint.latitudes)
+        self._lons = np.asarray(self.checkpoint.longitudes)
 
         self.pmask_in = torch.as_tensor(
             self.checkpoint.prognostic_input_mask, device=self.device, dtype=torch.long
@@ -145,6 +157,42 @@ class AIFSModel:
                 self._single_by_base[name] = i
         for base in self._levels_by_base:
             self._levels_by_base[base].sort(key=lambda t: t[0], reverse=True)  # high pressure (surface) first
+
+    # ------------------------------------------------------------------
+    # forecast_model.LatentForecastModel properties
+    # ------------------------------------------------------------------
+
+    @property
+    def timestep(self) -> datetime.timedelta:
+        return self._timestep
+
+    @property
+    def device(self) -> torch.device:
+        return self._device
+
+    @property
+    def lats(self) -> np.ndarray:
+        return self._lats
+
+    @property
+    def lons(self) -> np.ndarray:
+        return self._lons
+
+    def resolve_columns(self, name: str) -> list[int]:
+        """See forecast_model.LatentForecastModel.resolve_columns. Checks
+        `_levels_by_base` (pressure-level families) BEFORE `_single_by_base`/
+        `var_to_idx` -- checking the raw checkpoint mapping first would
+        silently shadow a family like `'z'` with a same-named single-column
+        entry (surface orography); see this method's callers and CLAUDE.md
+        for the real bug that shipped from getting this order backwards.
+        """
+        if name in self._levels_by_base:
+            return [i for _, i in self._levels_by_base[name]]
+        if name in self._single_by_base:
+            return [self._single_by_base[name]]
+        if name in self.var_to_idx:
+            return [self.var_to_idx[name]]
+        raise KeyError(f"{name!r} is not a known AIFS variable or family")
 
     # ------------------------------------------------------------------
     # State construction / decoding
@@ -184,7 +232,7 @@ class AIFSModel:
         state = torch.from_numpy(np.ascontiguousarray(tensor_np, dtype=np.float32)).to(self.device)
         return AIFSState(state, date)
 
-    def prime_runner_from_packed_state(self, aifs_state: AIFSState) -> AIFSState:
+    def prime_from_state(self, aifs_state: AIFSState) -> AIFSState:
         """Re-run the anemoi `Runner` bookkeeping that `prepare_initial_state()`
         builds as a side effect (`runner._input_tensor_by_name`,
         `runner._input_kinds`, and the `*_forcings_inputs` lists), starting

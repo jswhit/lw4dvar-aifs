@@ -233,7 +233,7 @@ def get_input(exp, model, logger):
         # normally built as a side effect of prepare_initial_state() on the
         # non-restart path, which restart skips -- rebuild it from the loaded
         # state (self-contained: no GRIB, no network).
-        input_encoded = model.prime_runner_from_packed_state(input_encoded)
+        input_encoded = model.prime_from_state(input_encoded)
         exp['restart_window'] = False
     else:
         back_date = add_hours(date, -exp['nhrs_back'])
@@ -316,8 +316,8 @@ def reset_skt_over_ocean(model, aifs_state, verif_ic, lsm_threshold=0.5):
     levels and across the whole rollout), so no extra fetch is needed for
     the mask -- only `skt`'s replacement values come from `verif_ic`.
     """
-    skt_idx = model.var_to_idx["skt"]
-    lsm_idx = model.var_to_idx["lsm"]
+    skt_idx = model.resolve_columns("skt")[0]
+    lsm_idx = model.resolve_columns("lsm")[0]
     state = aifs_state.state.clone()
     ocean_mask = state[0, 0, :, lsm_idx] < lsm_threshold  # constant across time levels
     skt_era5 = verif_ic["skt"].to(device=state.device, dtype=state.dtype)
@@ -609,9 +609,7 @@ def _resolve_loss_interp_specs(model, exp):
     names |= {'z'}
     specs = []
     for base in sorted(names):
-        known = (base in model._levels_by_base or base in model._single_by_base
-                 or base in model.var_to_idx)
-        if not known:
+        if not model.is_known_variable(base):
             raise KeyError(f"loss_variables entry {base!r} is not a model variable or family")
         specs.append((base, list(_DECODE_ALIASES.get(base, []))))
     return specs
@@ -647,23 +645,19 @@ def _resolve_control_mask(model, exp, n_vars, device):
     Returns `None` when `control_variables` is absent (no masking -- the
     increment is free on every variable, the default behaviour).
 
-    Name lookup order mirrors the mainline `state_scales` loop and CLAUDE.md:
-    `_levels_by_base` (pressure families) BEFORE `_single_by_base` /
-    `var_to_idx`, so `'z'` resolves to the 14-level geopotential family, not
-    the raw checkpoint's single surface-orography `'z'` column.
+    Column lookup (`model.resolve_columns`) checks pressure-level families
+    before any single-level/raw-checkpoint fallback -- see CLAUDE.md for the
+    bug that shipped from getting that order backwards, which is exactly
+    what `resolve_columns` now closes off at the source.
     """
     names = exp.get('control_variables')
     if names is None:
         return None
     mask = torch.zeros(n_vars, dtype=torch.bool, device=device)
     for base in names:
-        if base in model._levels_by_base:
-            cols = [i for _, i in model._levels_by_base[base]]
-        elif base in model._single_by_base:
-            cols = [model._single_by_base[base]]
-        elif base in model.var_to_idx:
-            cols = [model.var_to_idx[base]]
-        else:
+        try:
+            cols = model.resolve_columns(base)
+        except KeyError:
             raise KeyError(f"control_variables entry {base!r} is not a model variable or family")
         for i in cols:
             mask[i] = True

@@ -85,16 +85,29 @@ mask_sh = np.where(lats < -20., coslats, np.nan)
 mask_tr = np.where(np.logical_and(lats >= -20, lats <= 20), coslats, np.nan)
 
 
+def _z500_rms(mask, z500err):
+    # Exclude a point from BOTH the numerator and the weight-sum denominator
+    # if EITHER it's outside this region (mask already NaN there) OR the
+    # forecast itself is NaN (diverged) -- nansum-ing only the numerator
+    # (mask valid, but z500err NaN) would silently score a diverged field as
+    # a perfect 0.0 RMS error instead of "no data"; plain np.sum would
+    # instead propagate the mask's own expected out-of-region NaNs and
+    # report every region as "nan" even when nothing diverged. See
+    # z500err_window.py's getrms, which has the same fix.
+    w = np.where(np.isnan(z500err), np.nan, mask)
+    return np.sqrt(np.nansum(w * z500err ** 2) / np.nansum(w))
+
+
 def printz500err(label, f_decoded, verif_ic, date):
     # print z500 rms err
     z500err = (
         f_decoded['geopotential'][nlev500, :].detach().cpu().numpy()
         - verif_ic['geopotential'][nlev500, :].detach().cpu().numpy()
     ) / utils.GRAV
-    z500rmserrnh = np.sqrt(np.nansum(mask_nh * z500err ** 2) / np.nansum(mask_nh))
-    z500rmserrsh = np.sqrt(np.nansum(mask_sh * z500err ** 2) / np.nansum(mask_sh))
-    z500rmserrtr = np.sqrt(np.nansum(mask_tr * z500err ** 2) / np.nansum(mask_tr))
-    z500rmserrgl = np.sqrt(np.sum(coslats * z500err ** 2) / np.sum(coslats))
+    z500rmserrnh = _z500_rms(mask_nh, z500err)
+    z500rmserrsh = _z500_rms(mask_sh, z500err)
+    z500rmserrtr = _z500_rms(mask_tr, z500err)
+    z500rmserrgl = _z500_rms(coslats, z500err)
     print("%s %s %6.2f %6.2f %6.2f %6.2f" % (label, date, z500rmserrnh, z500rmserrtr, z500rmserrsh, z500rmserrgl))
 
 

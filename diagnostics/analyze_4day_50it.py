@@ -7,7 +7,7 @@ import json
 import numpy as np
 import xarray as xr
 
-OUT_DIR = "output/test_aifs_4day_100it_lr2e-3_lam0_precond_fixed/"
+OUT_DIR = "output/test_aifs_latent_reset_skt_n_init20_50it/"
 
 diag_files = sorted(glob.glob(OUT_DIR + "*_observation_diagnostics_*.nc"))
 assert diag_files, "no observation_diagnostics.nc found"

@@ -730,8 +730,194 @@ What this merge actually changed, relative to the pre-2026-09-11 mainline:
   still running at merge time; clean those up once it finishes, to avoid
   future confusion about which files are canonical.
 
+### Isolating AIFS-specific code behind a model interface (2026-09-11)
+
+Started at the user's request, to make a future different-model backend
+easier to swap in. Scoped deliberately to **latent-capable backends only**
+-- the solver's control variable lives exclusively in the model's hidden-
+mesh space (see "`control_space: 'latent'`" above), so there is no
+physical-space fallback to design for, and a backend without an accessible
+latent representation between its encoder and decoder is simply out of
+scope.
+
+**`forecast_model.py`** (new module) defines `LatentForecastModel`, an
+abstract base class capturing exactly the `model.*` surface
+`long_window_4dvar.py`/`long_window_4dvar_utils.py` actually call today
+(grepped every call site, not a speculative interface): `timestep`,
+`device`, `lats`/`lons`/`n_points`, `pressure_levels()`, `latent_shape`,
+`decode_state()`, `prepare_initial_state()`/`prime_from_state()`, `advance()`
+with its one-shot `latent_increment` hook, and a new `resolve_columns()`.
+`AIFSModel` (`aifs_model.py`) now formally subclasses it (confirmed via
+`AIFSModel.__abstractmethods__ == frozenset()` -- every abstract member is
+overridden, so the class is genuinely instantiable, not just
+duck-type-compatible).
+
+- **`resolve_columns(name) -> list[int]`** is the one genuinely new method,
+  not just a formalized rename. It consolidates what used to be three raw
+  dicts (`_levels_by_base`/`_single_by_base`/`var_to_idx`) that three
+  separate call sites in `long_window_4dvar_utils.py`
+  (`_resolve_control_mask`, `_resolve_loss_interp_specs`,
+  `reset_skt_over_ocean`) each re-derived their own lookup-order for.
+  CLAUDE.md already documented one real, shipped bug from getting that
+  order backwards (the retired `state_scales` loop silently resolving `'z'`
+  to a single orography column instead of the 14-level geopotential
+  family -- see the debugging notes far above). Folding the correct
+  precedence into one method on the model, called by all three sites (now
+  migrated: `model.resolve_columns(base)` / `model.is_known_variable(base)`
+  replaces the inline `if base in model._levels_by_base: ... elif ...`
+  chains), closes off that entire bug class for any future backend, not
+  just AIFS.
+- `timestep`/`device`/`lats`/`lons` moved from plain `__init__`-assigned
+  attributes to real `@property`s backed by `self._timestep`/`self._device`/
+  `self._lats`/`self._lons` (required for ABC conformance -- an abstract
+  `@property` is only satisfied by a class-level descriptor override; a
+  same-named instance attribute set in `__init__` does NOT satisfy it, and
+  `AIFSModel(...)` would raise `TypeError` at construction if left as plain
+  attributes). `n_points` is no longer assigned at all -- it's inherited as
+  a concrete (non-abstract) property computing `self.lats.size` from the
+  base class, and assigning `self.n_points = ...` in `__init__` would now
+  raise `AttributeError` (no setter) if it were still there.
+  `prime_runner_from_packed_state` was renamed to `prime_from_state` to
+  match the interface's naming (one call site, in `get_input()`, updated).
+  Every other pre-existing `AIFSModel` method/property signature already
+  matched the interface as-is, so this was otherwise a mechanical migration
+  -- verified with `py_compile` on all four touched/added files (this
+  module, `aifs_model.py`, `long_window_4dvar_utils.py`,
+  `long_window_4dvar.py`) plus an actual import + `__abstractmethods__`
+  check (no GPU/checkpoint needed for that).
+- **Deliberately NOT touched**: the enumeration-style loops in
+  `get_input`/`get_verif`/`save_xr_trajectory`/`save_inputs_nc`
+  (`for base, levels in model._levels_by_base.items(): ...`, building a
+  field dict or netCDF dataset over *every* known family/single variable)
+  still reach `_levels_by_base`/`_single_by_base` directly. `resolve_columns`
+  only covers "columns for one named variable" -- enumerating the full
+  schema is a different operation this pass didn't design an interface
+  method for. `smoke_test_latent_control.py`'s one direct `model.var_to_idx`
+  use was also left alone (a standalone test script, not part of the
+  solver-core/backend boundary this pass targeted).
+- **`aifs_grid.GridInterpolator` needed zero changes** -- confirmed by
+  inspection, not just asserted: it already takes only `(lons, lats)`
+  arrays and does k-d-tree/inverse-distance interpolation with no AIFS-
+  specific assumptions, so it was never part of the isolation problem.
+- **`InitialConditionProvider`** (sketched in `forecast_model.py`, NOT
+  implemented) was deliberately left unformalized after checking how deep
+  `aifs_ic.py`'s actual `Runner` coupling goes: `build_input_state`/
+  `read_single_date_fields` call `runner.variables.retrieved_*_variables()`,
+  `runner.checkpoint.lagged`, construct a real `GribFileInput(runner, ...)`,
+  and call `runner._combine_states(...)` -- genuine anemoi-internal
+  machinery, not 2-3 things a thin wrapper method could cleanly hide. So
+  `model.runner` stays a public, deliberate escape hatch used only by
+  `aifs_ic.py`-adjacent code (`get_input`/`get_verif` in
+  `long_window_4dvar_utils.py`) -- a real backend swap would need its own
+  IC-fetching module with its own relationship to its own runtime/library
+  internals anyway, not a generic wrapper around anemoi's `Runner`
+  specifically. This is a considered scope decision, not an oversight to
+  fix later without cause.
+
+### `control_variables` 20-cycle learn_rate sweep: 1.e-3 is the ceiling for this config (2026-09-11)
+
+Followed up the `config_ctlvars_20cycle.yml` 20-cycle run (`learn_rate:
+1.e-3`, completed cleanly -- see "Merge to mainline" above) with the same
+config at `learn_rate: 2.e-3` (`config_ctlvars_20cycle_lr2e-3.yml`, job
+21190537, `exp_name: test_aifs_ctlvars_n_init20_50it_lr2e-3`), the same
+escalation step that worked fine for the single-window, unrestricted-latent
+`config_4day_50it.yml` test (see "real-DA-window results" above: `1.e-4 ->
+1.e-3 -> 2.e-3`, all stable there). **It did not work here**: cycle 1's
+optimization diverged to NaN geopotential outright, and because this
+config cycles (`cycle: True`, `restart: False` -- each cycle's background is
+the previous cycle's analysis advanced forward), the corruption cascaded
+into every following cycle's background too. Caught via `z500err_window.py`
+(new script, see below) rather than the driver's own log: `printz500err`'s
+NH/Tropics/SH columns misleadingly printed `0.00` for the diverged cycles
+instead of `nan` -- a real, separate bug (`z500rmserrgl` uses `np.sum`,
+which propagates NaN, while the three regional RMS lines use `np.nansum`,
+which silently treats an all-NaN field as zero contribution -- so only the
+Global column actually flagged the divergence; a `0.00` regional print
+looks like a suspiciously *good* fit, not "no data," and is easy to miss
+next to the surrounding epoch/loss log lines). **Fixed** (2026-09-11):
+`printz500err` now routes all four regions through one `_z500_rms(mask,
+z500err)` helper that builds a combined weight (`np.where(np.isnan(z500err),
+np.nan, mask)`) before a single `nansum`/`nansum` ratio -- excludes a point
+if EITHER it's outside the region OR the forecast itself is NaN there,
+so a healthy run's regional RMS is unaffected (verified: a plain `np.sum`
+swap, tried first, broke the *healthy* case instead -- `mask_nh` etc. are
+built with genuine NaNs for every out-of-region point by design, which
+`np.sum` propagates unconditionally, so every regional line would print
+`nan` even with nothing diverged) while a diverged region now correctly
+prints `nan`. Same fix as `z500err_window.py`'s `getrms`.
+
+User killed job 21190537 after 4 cycles (1h16m, all 4 diverged) rather than
+let the remaining 16 cycles burn GPU time on corrupted state. **Conclusion:
+for this `control_variables`-masked, `reset_skt_ocean: True`, cycling
+config, `learn_rate: 1.e-3` is the largest stable value found so far** --
+higher than that worked for the single-window/unrestricted-latent config,
+but not here. Since the two configs differ in more than one way
+(`control_variables` masking, `reset_skt_ocean`, and genuine multi-cycle
+compounding vs. a single window), which of those is actually responsible
+for the lower ceiling is not yet isolated -- worth a deliberate follow-up
+(e.g. try `learn_rate: 2.e-3` with `control_variables` unmasked but
+otherwise identical) before assuming it's `control_variables` specifically.
+
+**Reproducibility check (2026-09-11, job 21199470,
+`config_ctlvars_repro_lr1e-3.yml`)**: reran the same config at
+`learn_rate: 1.e-3` for just the first 2 cycles (`n_init: 2`) after the
+`printz500err` fix above, to confirm the code changes since job 21155155
+(the dtobs merge's isolation refactor, the NaN-masking fix) hadn't altered
+behavior. Completed cleanly, no NaN. z500err/loss values matched job
+21155155's first two cycles to within the documented bf16 call-to-call
+noise floor (e.g. cycle 1 `z500err after` GL 6.82 vs. 6.81; loss ep50
+100167 vs. 99369) -- confirms `learn_rate: 1.e-3` still reproduces as
+expected, and that every `z500err` line now prints a real number (no
+`0.00`/`nan` artifacts) on a live run, not just the standalone check done
+earlier.
+
+**`z500err_window.py`** (new; both this and `z500err_ts.py` were moved into
+a `diagnostics/` subdirectory 2026-09-11 -- run as `python
+diagnostics/z500err_window.py ...` / `python diagnostics/z500err_ts.py ...`
+from the repo root, since their relative paths like `ic_cache/` assume that
+CWD; `z500err_window.py`'s `import aifs_ic` adds the repo root to
+`sys.path` itself to find it from the subdirectory) is what caught this. It
+recomputes Z500 RMS
+error directly from the saved `*_control_forecast_*.nc`/
+`*_optimal_forecast_*.nc` trajectories (the `'z'` variable at
+`level_z=500`, on AIFS's native grid -- lat/lon read straight from the
+file's own coordinates) against ERA5 truth read directly from
+`ic_cache/`'s cached GRIB files at every 6h lead time in the window,
+averaged across every cycle in an experiment -- a full error-growth curve
+per experiment, not one point. No AIFSModel/GPU load needed:
+`aifs_ic.read_single_date_fields`'s `runner` argument is only ever touched
+on a cache MISS (see `aifs_ic.fetch_era5_grib`), so `runner=None` is safe
+whenever `ic_cache/` is already warm for the dates needed (the common case
+for a completed/killed run) -- confirmed by direct test. **`z500err_ts.py`
+was then rewritten (2026-09-11) to reuse this same netCDF/ERA5 machinery**
+(`import z500err_window as zw`) instead of its original approach (parsing
+the driver's log for its one `z500err before/after` line per cycle, fixed
+at `dt_verif`) -- it now plots the time series ACROSS cycles at any one
+chosen lead time (CLI arg, any multiple of AIFS's 6h step, default 6 to
+match the old log-only behavior), complementing `z500err_window.py`'s
+across-lead-time-within-one-experiment view. Verified byte-for-byte
+consistent with the old log-parsed values at lead=6h (same means every
+region) before trusting it at other lead times. A
+subtlety worth remembering if this script is extended: `getrms` must treat
+a `diff` that's NaN as excluded from BOTH the numerator and the weight-sum
+denominator, not just zeroed by the region mask -- `np.nansum` of an
+all-NaN array silently returns `0.0`, not `NaN`, so the naive "mask via
+`coslat`, sum via `nansum`" approach (which is also what the driver's own
+regional `printz500err` lines do -- see above) silently reports a fully
+diverged forecast as a perfect 0.0 RMS error instead of "no data."
+
 ### Known gaps / next steps
 
+- **`forecast_model.LatentForecastModel` doesn't cover schema enumeration
+  or IC-fetching** -- see "Isolating AIFS-specific code" above for what was
+  and wasn't covered. A real second backend would still need: (1) a new
+  interface method (or an accepted direct-attribute exception, like
+  `model.runner` today) for the `get_input`/`get_verif`/
+  `save_xr_trajectory`/`save_inputs_nc` loops that enumerate every known
+  variable family, not just look one up by name; (2) its own IC-fetching
+  module, not a reusable abstraction over anemoi's `Runner` (the coupling
+  there turned out too deep to generalize cheaply -- see that section for
+  specifics).
 - **`reset_skt_ocean` has now been run through a real multi-cycle DA run**
   (`reset_skt_ocean: True` in both the original mainline 20-cycle run and
   the `control_variables` 20-cycle comparison, job 21155155, completed
@@ -753,11 +939,15 @@ What this merge actually changed, relative to the pre-2026-09-11 mainline:
   instead of the current "N/A") is unimplemented -- would need extending
   `get_verif`/`aifs_ic.py` to accept an arbitrary date rather than always
   the window-start date.
-- Now that `control_space: 'latent'` is confirmed to out-converge the
-  physical-space baseline at `learn_rate: 1.e-3` (see above), worth pushing
-  `learn_rate` above `1.e-3` (below the `5.e-3` that diverged) to see if it
-  can go further while staying stable, same escalation approach physical
-  space's own tuning used.
+- ~~Now that `control_space: 'latent'` is confirmed to out-converge the
+  physical-space baseline at `learn_rate: 1.e-3`, worth pushing `learn_rate`
+  above `1.e-3`~~ -- tried for the `control_variables`-masked, cycling
+  20-cycle config: `2.e-3` diverged to NaN on cycle 1 and cascaded through
+  every following cycle. See "`control_variables` 20-cycle learn_rate
+  sweep" above -- `1.e-3` is the ceiling found so far *for that config*;
+  not yet re-tried for the single-window/unrestricted-latent config this
+  bullet originally meant (which had gone `1.e-4 -> 1.e-3 -> 2.e-3`, all
+  stable, at last check).
 - One DA cycle / 16-verif-step (4-day) / 100-epoch test
   (`config_4day_50it.yml`) is the largest run so far, and the best result to
   date: `learn_rate: 2.e-3`, `weight_decay: 1.e-3`, `lam: 0`,
@@ -774,9 +964,14 @@ What this merge actually changed, relative to the pre-2026-09-11 mainline:
   this point.
 - Learning rate has gone `1.e-4` (stable, small effect) -> `1.e-3` (33.8%
   RMS reduction) -> `2.e-3` (53.4% RMS reduction, still improving at epoch
-  100, still no divergence) across successive user-directed increases --
-  it's plausible further increases keep helping and haven't found a ceiling
-  yet.
+  100, still no divergence) across successive user-directed increases for
+  this (single-window, unrestricted-latent) config -- it's plausible
+  further increases keep helping and haven't found a ceiling yet *here*.
+  (A ceiling WAS found for the different `control_variables`-masked,
+  20-cycle config -- `2.e-3` diverged there; see "`control_variables`
+  20-cycle learn_rate sweep" above. Not yet established whether that's
+  really about `control_variables` specifically or the cycling/compounding
+  itself.)
 - `n_init: 100` (config.yml.template's full production setting) hasn't been
   attempted -- `aifs_prefetch_ic.py` needs to warm the cache for the whole
   100-cycle date range first (100 CDS fetches).
