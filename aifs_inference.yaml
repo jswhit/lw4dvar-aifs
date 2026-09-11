@@ -1,0 +1,57 @@
+description: |
+  Static anemoi-inference config for the AIFS 4D-Var driver (aifs_model.py).
+  Only checkpoint/pre_processors/post_processors/patch_metadata/typed_variables
+  are actually used -- the driver never calls runner.execute()/run(), only the
+  lower-level pieces (runner.model, runner.checkpoint, runner.prepare_input_tensor,
+  runner.create_*_input(), runner.copy_prognostic_fields_to_input_tensor(), ...).
+  `input`/`output`/`date`/`lead_time` below are placeholders required for the
+  config to load and are never exercised.
+
+checkpoint: aifs-single-2.0/aifs-single-mse-2.0.ckpt
+
+date: 2015-01-01T00
+lead_time: 6
+input: opendata
+output:
+  grib:
+    path: /dev/null
+
+pre_processors:
+  - forward-transform-filter: cos_sin_mean_wave_direction
+  - forward-transform-filter: # Mask fix
+      filter: apply-mask
+      param:
+        - sd
+        - swvl1
+        - swvl2
+      path: aifs-single-2.0/lsm.grib
+      mask_value: 0
+
+post_processors:
+  - backward-transform-filter: cos_sin_mean_wave_direction
+  - accumulate_from_start_of_forecast
+
+patch_metadata:
+  dataset:
+    constant_fields: [z, sdor, slor, lsm]
+
+use_grib_paramid: false
+allow_nans: true
+typed_variables:
+  mwd:
+    mars:
+      param: mwd
+      stream: wave
+      levtype: sfc
+  swh: # checkpoint metadata points at paramId 3100 (post-2026 operational wave
+       # table), which ERA5 does not have; resolve by shortname within the
+       # wave stream instead, same trick as the mwd override above.
+    mars:
+      param: swh
+      stream: wave
+      levtype: sfc
+  snowc: # Encoding fix
+    mars:
+      param: fscov
+      stream: oper
+      levtype: sfc

@@ -1,0 +1,105 @@
+exp:
+  # (NeuralGCM's `local`/`perfect` flags are gone: get_input() always builds
+  # the very first initial condition from an ERA5 forecast `nhrs_back` hours
+  # before `sdate`, fetched via CDS -- see aifs_ic.py.)
+  nhrs_back: 48 # initialize with a forecast this many hours before from sdate
+  #restart: True # restart from a previous experiment
+  restart: False
+  rpath: './output/<previous_exp_name>/' # only read if restart: True -- the previous experiment's output dir
+  obspath: './psobs' # path to ps observation text files
+  nobs_max: 15000
+  ic_suffix: '96h_50it' # pkl file info for restart
+  sdate: '2015-01-01T00' # experiment start date; if restart, use date in pkl filename
+  #sdate: '2015-03-16T06' # experiment start date; if restart, use date in pkl filename
+  n_init: 100 # number of DA cycles
+  dt_init: 6 # assimilation cycling interval in hours (must be a multiple of AIFS's fixed 6h step)
+  # for longer forecast (if not present, long forecast not run)
+# dt_forecast: 24 # long forecast output interval in hours
+# n_forecast: 10 # long forecast length in steps of length dt_forecast
+# save initial and final trajectory output on these isobaric levels (set to "all" for all levels)
+  #save_levs = 'all'
+  #save_levs: [1000, 925, 850, 750, 700, 650, 600, 550, 500, 450, 400, 350, 300, 250, 200, 150, 100, 70, 50]
+  save_levs: [1000, 850, 500]
+  cycle: True # cycling data assimilation
+  exp_name: 'test_realpsobs_3hrly_4d_2015_updateinc' # data is saved in this subdirectory
+  model_name: 'aifs-single-mse-2.0.ckpt'
+  path_model: './aifs-single-2.0/' # where the model checkpoint is located
+  aifs_config: 'aifs_inference.yaml' # static anemoi-inference config (pre/post-processors, typed_variables)
+  device: 'cuda'
+  path_output: './output/' # where to write output named by subdirectory exp_name
+  # ERA5 initial-condition/verification fetches (aifs_ic.py) are cached here.
+  # The fetch itself needs internet (CDS) -- see CLAUDE.md's prefetch note:
+  # warm this cache from a login node before submitting the (offline) H100 job.
+  ic_cache: './ic_cache/'
+  print_every: 50
+  oberrstart: -1.0 # ob error at start of window.
+  oberrdeltaperday: 0.0 # ob error increase (per day) within window.
+  # The 4D-Var control variable is an increment in AIFS's hidden-mesh
+  # encoder-output space (AIFSModel.latent_shape: 40320 O96 mesh nodes x
+  # 1024 channels), injected as a one-time forcing at the first rollout
+  # step -- NOT a physical-space perturbation (see CLAUDE.md's
+  # "control_space: 'latent'" section for the full architectural reasoning;
+  # an earlier physical-space path with per-variable `state_scales`
+  # preconditioning was removed once latent control was confirmed to
+  # out-converge it with no per-variable tuning needed). Because AIFS's
+  # decoder produces the next time level as a residual rather than
+  # reconstructing the current one, the analysis this produces is only
+  # ever valid at `window_start + dt_verif`, never at `window_start`
+  # itself -- compute_optimal returns an AIFSState carrying that date, and
+  # downstream code (the cycling loop, save_trajectory_diagnostics,
+  # printz500err) is built around it; printz500err's "after" line prints
+  # "N/A" rather than a number (no ERA5 truth is fetched at the shifted
+  # date). Judge convergence quality from the run's loss-history JSON
+  # (`*_loss_latent_*.json`).
+  latent_scale: 1.0 # optional global preconditioner divided into the
+  #   latent increment inside the differentiable forward pass (rarely
+  #   needed -- tune learn_rate first, see CLAUDE.md)
+  # control_variables: decode-time mask (top-level exp: key, list of AIFS
+  # variable/family base names, e.g. [u, v, t, z, sp]) -- at the injection
+  # step, packed-state columns NOT named here are overwritten with the
+  # uncorrected first-step forecast, zeroing the increment's *direct*
+  # effect on them (they can still respond indirectly, through model
+  # dynamics, to columns that ARE controlled). Omit for unrestricted (every
+  # column controllable), the default. See CLAUDE.md's "Merge to mainline"
+  # section for how this was validated.
+  # control_variables: [u, v, t, z, sp]
+  # loss_variables: which decode_state fields are (time-interpolated, for
+  # dt_obs < dt_verif, and) fed to the ps forward operator -- base names
+  # 'z'/'t'/'q'/'sp'. Defaults to exactly what the active ps_operator reads
+  # ('logpinterp': z; 'ps': t, q, sp) -- only set this to something other
+  # than the default if you know you need to.
+  # loss_variables: [z]
+
+  # reset_skt_ocean: False (default) resets `skt` (skin temperature) at
+  # ocean grid points (lsm < skt_ocean_lsm_threshold) to fresh ERA5 truth at
+  # every new analysis time (every DA cycle -- NOT every window within one
+  # cycle), instead of letting the model's own carried-forward/predicted skt
+  # persist there across cycles. This checkpoint has no separate SST or
+  # sea-ice variable -- skt is its only surface-temperature-like prognostic
+  # field, and ECMWF's own operational/ERA5 skt is already defined as the
+  # SST analysis over open ocean (blended via the land-sea mask upstream of
+  # this whole pipeline) -- see long_window_4dvar_utils.reset_skt_over_ocean's
+  # docstring and CLAUDE.md for the sst/skt investigation this came from.
+  # No sea-ice handling: there's no sea-ice variable in this checkpoint to
+  # reset in the first place.
+  # reset_skt_ocean: False
+  # skt_ocean_lsm_threshold: 0.5 # lsm is a land fraction in [0, 1]; grid
+  #   points below this are treated as "ocean" for the reset
+
+windows:
+  '4': # window name (days)
+    n_verif: 16 # window length in units of dt_verif (96h window, same length as dt_verif=3/n_verif=32 was)
+    dt_verif: 6 # spacing between verification times, in hours -- must be a multiple of AIFS's fixed 6h step
+    #dt_obs: 6 # ps observation sampling interval in hours (default dt_verif;
+    #   must divide both dt_verif and AIFS's fixed 6h step). Finer than 6h
+    #   obs are matched to a linearly time-interpolated model state between
+    #   the bracketing 6h steps -- see CLAUDE.md's "Merge to mainline"
+    #   section, including a known unmitigated tidal (S2) representativeness
+    #   error at off-step slots.
+    learn_rate: 1.e-4 # learning rate
+    weight_decay: 1.e-3 # weight decay regularization
+    max_epoch: 50 # number of epochs
+    bg_check: 4. # background check
+    zthresh: 500. # orog diff threshold
+    zconst: 0.003 # factor to boost ob error
+    suffix: ''
