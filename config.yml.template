@@ -69,8 +69,8 @@ exp:
   # ('logpinterp': z; 'ps': t, q, sp) -- only set this to something other
   # than the default if you know you need to.
   # loss_variables: [z]
-  # don't update wave variables or skt.
-  control_variables: [u, v, t, z, sp, q, msl, 2t, 2d, 10u, 10v, tcw]
+  # don't update wave variables or volumetric soil moisture (vsw).
+  control_variables: [u, v, t, z, q, sp, msl, 2t, 2d, 10u, 10v, tcw, skt, sot]
 
   # reset_skt_ocean: False (default) resets `skt` (skin temperature) at
   # ocean grid points (lsm < skt_ocean_lsm_threshold) to fresh ERA5 truth at
