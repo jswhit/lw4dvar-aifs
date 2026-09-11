@@ -11,7 +11,7 @@ exp:
   ic_suffix: '96h_50it' # pkl file info for restart
   sdate: '2015-01-01T00' # experiment start date; if restart, use date in pkl filename
   #sdate: '2015-03-16T06' # experiment start date; if restart, use date in pkl filename
-  n_init: 100 # number of DA cycles
+  n_init: 20 # number of DA cycles
   dt_init: 6 # assimilation cycling interval in hours (must be a multiple of AIFS's fixed 6h step)
   # for longer forecast (if not present, long forecast not run)
 # dt_forecast: 24 # long forecast output interval in hours
@@ -21,7 +21,7 @@ exp:
   #save_levs: [1000, 925, 850, 750, 700, 650, 600, 550, 500, 450, 400, 350, 300, 250, 200, 150, 100, 70, 50]
   save_levs: [1000, 850, 500]
   cycle: True # cycling data assimilation
-  exp_name: 'test_realpsobs_3hrly_4d_2015_updateinc' # data is saved in this subdirectory
+  exp_name: 'test_aifs_latent_reset_skt_n_init20_50it' # data is saved in this subdirectory
   model_name: 'aifs-single-mse-2.0.ckpt'
   path_model: './aifs-single-2.0/' # where the model checkpoint is located
   aifs_config: 'aifs_inference.yaml' # static anemoi-inference config (pre/post-processors, typed_variables)
@@ -31,7 +31,7 @@ exp:
   # The fetch itself needs internet (CDS) -- see CLAUDE.md's prefetch note:
   # warm this cache from a login node before submitting the (offline) H100 job.
   ic_cache: './ic_cache/'
-  print_every: 50
+  print_every: 10
   oberrstart: -1.0 # ob error at start of window.
   oberrdeltaperday: 0.0 # ob error increase (per day) within window.
   # The 4D-Var control variable is an increment in AIFS's hidden-mesh
@@ -69,6 +69,8 @@ exp:
   # ('logpinterp': z; 'ps': t, q, sp) -- only set this to something other
   # than the default if you know you need to.
   # loss_variables: [z]
+  # don't update wave variables or skt.
+  control_variables: [u, v, t, z, sp, q, msl, 2t, 2d, 10u, 10v, tcw]
 
   # reset_skt_ocean: False (default) resets `skt` (skin temperature) at
   # ocean grid points (lsm < skt_ocean_lsm_threshold) to fresh ERA5 truth at
@@ -82,8 +84,8 @@ exp:
   # docstring and CLAUDE.md for the sst/skt investigation this came from.
   # No sea-ice handling: there's no sea-ice variable in this checkpoint to
   # reset in the first place.
-  # reset_skt_ocean: False
-  # skt_ocean_lsm_threshold: 0.5 # lsm is a land fraction in [0, 1]; grid
+  reset_skt_ocean: True
+  skt_ocean_lsm_threshold: 0.5 # lsm is a land fraction in [0, 1]; grid
   #   points below this are treated as "ocean" for the reset
 
 windows:
@@ -96,7 +98,7 @@ windows:
     #   the bracketing 6h steps -- see CLAUDE.md's "Merge to mainline"
     #   section, including a known unmitigated tidal (S2) representativeness
     #   error at off-step slots.
-    learn_rate: 1.e-4 # learning rate
+    learn_rate: 1.e-3 # learning rate
     weight_decay: 1.e-3 # weight decay regularization
     max_epoch: 50 # number of epochs
     bg_check: 4. # background check
