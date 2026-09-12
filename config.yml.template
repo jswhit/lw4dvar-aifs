@@ -8,11 +8,11 @@ exp:
   rpath: './output/<previous_exp_name>/' # only read if restart: True -- the previous experiment's output dir
   obspath: './psobs' # path to ps observation text files
   nobs_max: 15000
-  ic_suffix: '96h_50it' # pkl file info for restart
+  ic_suffix: '96h_100it' # pkl file info for restart
   sdate: '2015-01-01T00' # experiment start date; if restart, use date in pkl filename
   #sdate: '2015-03-16T06' # experiment start date; if restart, use date in pkl filename
-  n_init: 20 # number of DA cycles
-  dt_init: 6 # assimilation cycling interval in hours (must be a multiple of AIFS's fixed 6h step)
+  n_init: 24 # number of DA cycles
+  dt_init: 12 # assimilation cycling interval in hours (must be a multiple of AIFS's fixed 6h step)
   # for longer forecast (if not present, long forecast not run)
 # dt_forecast: 24 # long forecast output interval in hours
 # n_forecast: 10 # long forecast length in steps of length dt_forecast
@@ -100,7 +100,10 @@ windows:
     #   error at off-step slots.
     learn_rate: 1.e-3 # learning rate
     weight_decay: 1.e-3 # weight decay regularization
-    max_epoch: 50 # number of epochs
+    max_epoch: 100 # number of epochs
+    warmup_steps: 10 # epochs for linear warmup
+    start_factor: 0.01 # start factor for learning rate at beginning of warmup
+    end_factor: 0.001 # end factor for learning rate at end of cosine decay
     bg_check: 4. # background check
     zthresh: 500. # orog diff threshold
     zconst: 0.003 # factor to boost ob error

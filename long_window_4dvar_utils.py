@@ -164,6 +164,9 @@ def get_window(exp, window, windows):
     exp['learn_rate'] = windows[window]['learn_rate']
     exp['weight_decay'] = windows[window]['weight_decay']
     exp['max_epoch'] = windows[window]['max_epoch']
+    exp['warmup_steps'] = windows[window]['warmup_steps']
+    exp['start_factor'] = windows[window]['start_factor']
+    exp['end_factor'] = windows[window]['end_factor']
     exp['window_name'] = str(exp['n_verif'] * dt_verif)
     exp['suffix'] = windows[window]['suffix']
     return exp
@@ -183,6 +186,9 @@ def log_window(exp, logger):
     logger.info('   learn_rate: ' + str(exp['learn_rate']))
     logger.info('   weight_decay: ' + str(exp['weight_decay']))
     logger.info('   max_epoch: ' + str(exp['max_epoch']))
+    logger.info('   start_factor: ' + str(exp['start_factor']))
+    logger.info('   end_factor: ' + str(exp['end_factor']))
+    logger.info('   warmup_steps: ' + str(exp['warmup_steps']))
     logger.info('   window_name: ' + str(exp['window_name']))
     logger.info('   suffix: ' + str(exp['suffix']))
     return
@@ -896,10 +902,42 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
             ref_state1 = model.advance(input_encoded, steps=1, use_checkpoint=False)
 
     optimizer = torch.optim.AdamW([increment], lr=lr, weight_decay=wd)
-    warmup_steps = 10
-    def lr_lambda(step):
-        return min(1.0, 0.1 + 0.9 * step / warmup_steps)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    # linear warmup, no decay
+    #warmup_steps = exp['warmup_steps']
+    #start_factor = exp['start_factor']
+    #def lr_lambda(step):
+    #    return min(1.0, start_factor + (1.-start_factor) * step / warmup_steps)
+    #scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    # linear warmup/cosine decay
+    # (parameters: warmup_steps, start_factor, end_factor)
+    total_steps = exp['max_epoch']
+    warmup_steps = exp['warmup_steps']
+    start_factor = exp['start_factor']
+    eta_min      = lr*exp['end_factor']
+    decay_steps = total_steps - warmup_steps
+    # Create the individual schedulers
+    # Linear Warmup: starts from lr * start_factor and scales up to lr
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+     optimizer,
+     start_factor=start_factor,
+     end_factor=1.0,
+     total_iters=warmup_steps 
+    )
+    # Cosine Decay: decays from lr down to eta_min over decay_steps
+    decay_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+     optimizer,
+     T_max=decay_steps,
+     eta_min=eta_min
+    )
+    # Combine them sequentially
+    # milestones indicates the step index at which to switch schedulers
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+     optimizer,
+     schedulers=[warmup_scheduler, decay_scheduler],
+     milestones=[warmup_steps]
+    )
 
     lsave = []
     loss_min = 1e19
@@ -950,8 +988,7 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
 
         optimizer.step()
         scheduler.step()
-
-        logger.info(f'epoch={epoch}, loss={loss.item()}')
+        logger.info(f'epoch={epoch}, lr={scheduler.get_last_lr()[0]}, loss={loss.item()}')
 
     if increment_best is not None:
         pt_file = exp['path_output'] + exp['date'] + '_latent_increment_' + exp['window_name'] + 'h' + exp['suffix'] + '_' + str(max_epoch) + 'it.pt'
