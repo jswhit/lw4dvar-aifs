@@ -98,12 +98,12 @@ windows:
     #   the bracketing 6h steps -- see CLAUDE.md's "Merge to mainline"
     #   section, including a known unmitigated tidal (S2) representativeness
     #   error at off-step slots.
-    learn_rate: 1.e-3 # learning rate
+    learn_rate: 2.e-3 # learning rate
     weight_decay: 1.e-3 # weight decay regularization
     max_epoch: 100 # number of epochs
     warmup_steps: 10 # epochs for linear warmup
-    start_factor: 0.01 # start factor for learning rate at beginning of warmup
-    end_factor: 0.001 # end factor for learning rate at end of cosine decay
+    start_factor: 0.1 # start factor for learning rate at beginning of warmup
+    end_factor: 0.1 # end factor for learning rate at end of cosine decay
     bg_check: 4. # background check
     zthresh: 500. # orog diff threshold
     zconst: 0.003 # factor to boost ob error
