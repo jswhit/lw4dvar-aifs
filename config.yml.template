@@ -87,6 +87,7 @@ exp:
   reset_skt_ocean: True
   skt_ocean_lsm_threshold: 0.5 # lsm is a land fraction in [0, 1]; grid
   #   points below this are treated as "ocean" for the reset
+  #ps_operator = "ps" # default "logpinterp"
 
 windows:
   '4': # window name (days)
