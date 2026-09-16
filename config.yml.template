@@ -19,7 +19,7 @@ exp:
 # save initial and final trajectory output on these isobaric levels (set to "all" for all levels)
   #save_levs = 'all'
   #save_levs: [1000, 925, 850, 750, 700, 650, 600, 550, 500, 450, 400, 350, 300, 250, 200, 150, 100, 70, 50]
-  save_levs: [1000, 850, 500]
+  save_levs: [1000, 850, 500, 250, 50]
   cycle: True # cycling data assimilation
   exp_name: 'test_aifs_latent_reset_skt_n_init20_50it' # data is saved in this subdirectory
   model_name: 'aifs-single-mse-2.0.ckpt'
@@ -32,8 +32,10 @@ exp:
   # warm this cache from a login node before submitting the (offline) H100 job.
   ic_cache: './ic_cache/'
   print_every: 10
-  oberrstart: -1.0 # ob error at start of window.
-  oberrdeltaperday: 0.0 # ob error increase (per day) within window.
+  # optionally increase ob error linearly through window to give more weight to 
+  # loss at beginning of window (crude treatment of model error).
+  oberrstart: 1.0 # ob error at start of window (-1 to use values in obs file)
+  oberrdeltaperday: 0.25 # ob error increase (per day) within window.
   # The 4D-Var control variable is an increment in AIFS's hidden-mesh
   # encoder-output space (AIFSModel.latent_shape: 40320 O96 mesh nodes x
   # 1024 channels), injected as a one-time forcing at the first rollout
@@ -51,7 +53,7 @@ exp:
   # "N/A" rather than a number (no ERA5 truth is fetched at the shifted
   # date). Judge convergence quality from the run's loss-history JSON
   # (`*_loss_latent_*.json`).
-  latent_scale: 1.0 # optional global preconditioner divided into the
+  #latent_scale: 1.0 # optional global preconditioner divided into the
   #   latent increment inside the differentiable forward pass (rarely
   #   needed -- tune learn_rate first, see CLAUDE.md)
   # control_variables: decode-time mask (top-level exp: key, list of AIFS
@@ -88,6 +90,17 @@ exp:
   skt_ocean_lsm_threshold: 0.5 # lsm is a land fraction in [0, 1]; grid
   #   points below this are treated as "ocean" for the reset
   #ps_operator = "ps" # default "logpinterp"
+  # **`checkpoint_stride` (new top-level `exp:` key, default 1 -- unchanged
+  # behavior)**: `AIFSModel.advance()` already accepted a per-call
+  # `use_checkpoint` bool; `compute_loss_4dvar` now computes it per rollout
+  # step as `(checkpoint_stride > 0) and (step % checkpoint_stride == 0)`
+  # instead of hardcoding `True`. `torch.utils.checkpoint` trades memory for
+  # compute (recomputes each wrapped step's forward during backward) --
+  # wrapping literally every step, as the code did unconditionally before this,
+  # only pays for itself if the rollout doesn't fit in memory without it. Set
+  # `checkpoint_stride: 0` to disable checkpointing entirely (memory-rich
+  # GPU/short window) or `> 1` to checkpoint only 1-in-N steps.
+  #checkpoint_stride: 0
 
 windows:
   '4': # window name (days)
@@ -99,8 +112,8 @@ windows:
     #   the bracketing 6h steps -- see CLAUDE.md's "Merge to mainline"
     #   section, including a known unmitigated tidal (S2) representativeness
     #   error at off-step slots.
-    learn_rate: 2.e-3 # learning rate
-    weight_decay: 1.e-3 # weight decay regularization
+    learn_rate: 2.0e-3 # learning rate
+    weight_decay: 1.0e-3 # weight decay regularization
     max_epoch: 100 # number of epochs
     warmup_steps: 10 # epochs for linear warmup
     start_factor: 0.1 # start factor for learning rate at beginning of warmup
