@@ -95,6 +95,17 @@ class AIFSModel(forecast_model.LatentForecastModel):
         # that only need checkpoint metadata (aifs_ic.py's prefetch, run from
         # a login node with no GPU) can request device='cpu' without editing
         # the yaml, while the H100 driver gets 'cuda'.
+        if device == "cuda":
+            # The forward rollout already runs its heaviest ops under a bf16
+            # torch.autocast (see _predict_step_with_grad*), and this whole
+            # pipeline already tolerates bf16-level numerical noise (see
+            # CLAUDE.md's finite-difference-checks note) -- so there's no
+            # accuracy reason to force full fp32 matmul precision for
+            # whatever falls outside that autocast block (e.g.
+            # pre_processors/post_processors). TF32 is a free speedup there.
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+
         config = RunConfiguration.load(config_path, [f"device={device}", f"checkpoint={checkpoint_path}"])
         self.runner = create_runner(config)
         self.runner.model.eval()
@@ -265,7 +276,9 @@ class AIFSModel(forecast_model.LatentForecastModel):
         }
         return self.prepare_initial_state(input_state, aifs_state.date)
 
-    def decode_state(self, aifs_state: AIFSState, time_index: int = -1) -> dict[str, torch.Tensor]:
+    def decode_state(
+        self, aifs_state: AIFSState, time_index: int = -1, only: "list[str] | None" = None
+    ) -> dict[str, torch.Tensor]:
         """Slice one time level of the packed tensor into a dict of
         {base_variable_name: tensor}, with pressure-level variables stacked
         into shape (n_levels, n_points) (highest pressure/surface first) and
@@ -275,14 +288,32 @@ class AIFSModel(forecast_model.LatentForecastModel):
         specific_humidity, surface_pressure, geopotential_at_surface -- are
         prognostic/constant inputs, so no separate "model output" decoding is
         needed).
+
+        `only`: restrict decoding to just these base names (family or
+        single-level), skipping the slice+transpose for every other one of
+        the checkpoint's ~15-20 families. Default (`None`) decodes
+        everything, as before -- used by diagnostics/netCDF-saving call sites
+        that need the full state. `compute_loss_4dvar`'s hot loop passes the
+        1-4 base names `_resolve_loss_interp_specs` says the loss actually
+        reads, since that loop runs `max_epoch x n_steps` times per window
+        and the other ~90+ unused columns' tensor ops were pure waste there.
         """
         tensor = aifs_state.state[:, time_index, :, :]  # (1, n_points, n_vars)
         tensor = tensor[0]  # (n_points, n_vars)
         out: dict[str, torch.Tensor] = {}
-        for base, levels in self._levels_by_base.items():
+        only_set = None if only is None else set(only)
+        levels_items = (
+            self._levels_by_base.items() if only_set is None
+            else ((b, self._levels_by_base[b]) for b in only_set if b in self._levels_by_base)
+        )
+        for base, levels in levels_items:
             cols = [i for _, i in levels]
             out[base] = tensor[:, cols].transpose(0, 1)  # (n_levels, n_points)
-        for name, i in self._single_by_base.items():
+        single_items = (
+            self._single_by_base.items() if only_set is None
+            else ((n, self._single_by_base[n]) for n in only_set if n in self._single_by_base)
+        )
+        for name, i in single_items:
             out[name] = tensor[:, i]  # (n_points,)
         # NeuralGCM-style aliases used by the ported loss/QC code.
         if "z" in out:
@@ -291,7 +322,7 @@ class AIFSModel(forecast_model.LatentForecastModel):
             out["temperature"] = out["t"]
         if "q" in out:
             out["specific_humidity"] = out["q"]
-        if "sp" in self._single_by_base:
+        if "sp" in out:
             out["surface_pressure"] = out["sp"]
         return out
 

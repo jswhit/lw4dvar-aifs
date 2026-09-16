@@ -906,8 +906,142 @@ all-NaN array silently returns `0.0`, not `NaN`, so the naive "mask via
 regional `printz500err` lines do -- see above) silently reports a fully
 diverged forecast as a perfect 0.0 RMS error instead of "no data."
 
+### Performance pass: TF32, selective decode_state, checkpoint_stride (2026-09-16)
+
+Requested by the user as a general "find and fix bottlenecks" pass. Initial
+version (written from a login node, no GPU access) had four changes; one
+(step-1 encoder caching) was implemented, measured on the H100, and then
+**reverted** after the measurement below -- see that subsection. The three
+that remain:
+
+- **`AIFSModel.decode_state()` gained an `only=[...]` filter** (aifs_model.py),
+  used by `compute_loss_4dvar`'s hot loop to build just the 1-4 base
+  families `_resolve_loss_interp_specs` says the loss actually reads,
+  instead of all ~15-20 families (most of the checkpoint's 106 variables)
+  every one of `max_epoch x n_steps` iterations. Every other call site
+  (diagnostics, netCDF saving) is unchanged -- `only=None` (the default)
+  still decodes everything. Fixed a latent bug this exposed along the way:
+  the `sp`/`surface_pressure` alias checked `"sp" in self._single_by_base`
+  (always true for this checkpoint) instead of `"sp" in out` -- harmless
+  before (decode_state always built everything, so `out` always had `sp`
+  too), but would have raised `KeyError` under `only=['z']` (the
+  `logpinterp` default, which never requests `sp`) had it not been caught
+  here.
+- **`checkpoint_stride` (new top-level `exp:` key, default 1 -- unchanged
+  behavior)**: `AIFSModel.advance()` already accepted a per-call
+  `use_checkpoint` bool; `compute_loss_4dvar` now computes it per rollout
+  step as `(checkpoint_stride > 0) and (step % checkpoint_stride == 0)`
+  instead of hardcoding `True`. `torch.utils.checkpoint` trades memory for
+  compute (recomputes each wrapped step's forward during backward) --
+  wrapping literally every step, as the code did unconditionally before this,
+  only pays for itself if the rollout doesn't fit in memory without it. Set
+  `checkpoint_stride: 0` to disable checkpointing entirely (memory-rich
+  GPU/short window) or `> 1` to checkpoint only 1-in-N steps -- **still not
+  tried on the H100 at any value other than the implicit default** (see
+  "Known gaps" below) -- the validation run described below left it at the
+  default, so it has not yet been shown to help.
+- **TF32 matmul enabled** (`torch.backends.cuda.matmul.allow_tf32` /
+  `cudnn.allow_tf32`, set once in `AIFSModel.__init__` when `device=='cuda'`):
+  free given this pipeline already tolerates bf16-level noise throughout
+  (see the finite-difference-checks note above); only affects whatever
+  computation falls outside the bf16 `torch.autocast` block used for the
+  model forward itself (pre/post-processors). No measurable effect seen in
+  the validation run below, consistent with "likely modest" -- most heavy
+  compute is already bf16-autocast regardless.
+
+#### H100 validation (2026-09-16): correctness confirmed, no measured speedup, encoder caching reverted
+
+Ran an A/B pair on the H100: the pre-perf-pass code (`git show HEAD:...` for
+`aifs_model.py`/`forecast_model.py`/`long_window_4dvar_utils.py`, in a
+sibling directory `../long-window-4dvar-aifsv2-perfcheck-baseline` built out
+of symlinks to everything else -- `ic_cache/`, `aifs-single-2.0/`, etc. --
+so the 59G/2.8G heavy assets weren't duplicated) vs. the perf-pass code, both
+against a trimmed copy of `config_4day_50it.yml` (`config_perfcheck_new.yml`
+/ `config_perfcheck_baseline.yml`, `max_epoch: 20` instead of 100 for a
+faster turnaround; also had to add `warmup_steps`/`start_factor`/
+`end_factor`, which `config_4day_50it.yml` as committed is missing --
+`get_window()` requires them unconditionally and every config file in the
+repo predates that scheduler; **this is a real, pre-existing gap unrelated
+to the performance pass** -- `config_4day_50it.yml` will crash with
+`KeyError` as-is against current mainline).
+
+- **Correctness: confirmed.** Loss trajectories matched epoch-by-epoch to
+  within 0.02-0.3% relative difference (e.g. epoch 20: 153837.78 vs
+  153524.81) -- comfortably inside the bf16 call-to-call noise floor this
+  file already treats as expected elsewhere (see the reproducibility-check
+  note above, which saw similarly-sized deltas). Both runs completed
+  cleanly, monotonic loss decrease, no NaN.
+- **Speed: no measurable difference.** Per-epoch time was statistically
+  identical (22.42s vs 22.47s average, 1-second timestamp resolution) --
+  the decode_state filter and TF32 made no detectable difference at this
+  scale. `checkpoint_stride` was left at its default (1) for this run, so
+  the one change most likely to actually move per-epoch time was never
+  exercised here -- this validation only proves the *default* path is
+  unchanged, not that a non-default `checkpoint_stride` helps (see "Known
+  gaps").
+- **Step-1 encoder caching made total wall-clock ~62s worse** (10:57 vs
+  9:55), entirely attributable to time-to-first-epoch (193s vs 131s setup),
+  i.e. `precompute_step1_encoder()`'s own one-time cost -- plausibly
+  double-paying first-call CUDA/kernel warmup (once building the cache,
+  again in epoch 1's own code path) rather than a fundamental inefficiency,
+  but per-epoch time showed no offsetting benefit to justify keeping it
+  unproven. **Reverted** (removed `precompute_step1_encoder`, the
+  `encoder_cache` param on `advance()`/`_advance_one_step()`/
+  `_predict_step_with_grad_latent()`, and its use in `compute_optimal`) --
+  back to computing the step-1 encoder fresh every epoch, exactly as before
+  this pass. If revisited, profile `precompute_step1_encoder` in isolation
+  first (is the ~60s really one-time warmup, amortized away over more
+  epochs, or a real per-call cost) before re-adding it.
+
+#### `checkpoint_stride` H100 validation (2026-09-16): real speedup, no correctness cost -- at 16 steps
+
+Ran `checkpoint_stride` at `1` (default/unchanged), `2`, and `0` (fully
+disabled) -- three otherwise-identical jobs against
+`config_perfcheck_stride{0,1,2}.yml` (same trimmed 20-epoch, 16-step/4-day
+window as the validation run above). All three completed cleanly, **no
+OOM even at `checkpoint_stride: 0`**.
+
+- **Correctness: confirmed.** Loss curves at `stride=2` and `stride=0`
+  matched `stride=1` to within 0.11%/0.16% mean relative difference (max
+  0.23%/0.37%) across all 20 epochs -- inside the same bf16 noise floor as
+  every other comparison in this file. All three monotonically decreased,
+  no divergence.
+- **Speed: real, monotonic per-epoch speedup as checkpointing decreases**:
+
+  | `checkpoint_stride` | avg epoch time | vs. stride=1 |
+  |---|---|---|
+  | 1 (checkpoint every step -- old default behavior) | 22.58s | -- |
+  | 2 (checkpoint every other step) | 19.79s | 12.4% faster |
+  | 0 (checkpointing fully disabled) | 17.05s | **24.5% faster** |
+
+  This is the first performance-pass change with a measured, meaningful
+  win. Total per-window savings at `stride=0` for a real 100-epoch run of
+  this window length would be roughly 100 x 5.5s =~ 9 minutes.
+- **Caveat -- only tested at 16 steps (4-day window).** Memory for
+  unchecked activations scales with rollout length, so this does NOT show
+  `checkpoint_stride: 0` is safe for the longer windows this repo actually
+  runs in production (up to 28 steps, `config_ctlvars_12h_100it_7day.yml`)
+  -- that needs its own test before relying on it there. `checkpoint_stride`
+  still defaults to `1` (the old, safe, always-fits behavior) in the code;
+  nothing here changes that default, it only demonstrates the lever works
+  and is worth using where memory allows.
+
 ### Known gaps / next steps
 
+- **`checkpoint_stride: 0` (or a partial value like `2`) is validated as a
+  real, correctness-preserving speedup for a 16-step (4-day) window (see
+  above) but UNTESTED at the longer windows this repo actually runs in
+  production** (up to 28 steps, `config_ctlvars_12h_100it_7day.yml`, and
+  the 20+-cycle experiments) -- activation memory for a non-checkpointed
+  step scales with rollout length, so 16-step headroom is not evidence for
+  28-step headroom. Test `checkpoint_stride: 0` (falling back to `2` or
+  higher if that OOMs) at the actual production window length before
+  changing any real experiment's config away from the default.
+  checkpointing frequency would measurably speed up an epoch. This is the
+  one remaining performance-pass lever worth testing (`decode_state`
+  filtering and TF32 were validated correct but showed no measurable
+  per-epoch speedup at 20-epoch scale; step-1 encoder caching was tried,
+  measured net negative, and reverted -- see above).
 - **`forecast_model.LatentForecastModel` doesn't cover schema enumeration
   or IC-fetching** -- see "Isolating AIFS-specific code" above for what was
   and wasn't covered. A real second backend would still need: (1) a new

@@ -180,6 +180,7 @@ def log_window(exp, logger):
     logger.info('   loss_variables: ' + str(exp.get('loss_variables', '(default from ps_operator)')))
     logger.info('   control_variables: ' + str(exp.get('control_variables', '(all -- increment unrestricted)')))
     logger.info('   latent_scale: ' + str(exp.get('latent_scale', 1.0)))
+    logger.info('   checkpoint_stride: ' + str(exp.get('checkpoint_stride', 1)) + ' (1 = checkpoint every step)')
     if 'bg_check' in exp: logger.info('   bg_check: ' + str(exp['bg_check']))
     if 'zthresh' in exp: logger.info('   zthresh: ' + str(exp['zthresh']))
     if 'zconst' in exp: logger.info('   zconst: ' + str(exp['zconst']))
@@ -790,6 +791,15 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
     steps before the ordinary spatial interp + forward operator + QC
     (`_compute_ps_observation_diagnostics_at_time`). `dt_obs == dt_verif`
     reduces to one slot per step with every `alpha == 0`.
+
+    `exp['checkpoint_stride']` (default 1, i.e. every step -- unchanged
+    behavior): only every `checkpoint_stride`-th step is wrapped in
+    `torch.utils.checkpoint` (trading memory for speed -- a non-checkpointed
+    step keeps its activations for backward instead of recomputing them). Set
+    to 0 to disable checkpointing entirely for a memory-rich GPU/short
+    window; validate with the usual "does AdamW still monotonically reduce
+    the loss" check before trusting a non-default value on a new
+    window length.
     """
     scaled_increment = latent_increment / latent_scale
     dt_verif = exp['dt_verif']
@@ -797,6 +807,9 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
     dt_obs = exp['dt_obs']
     timestep_h = int(round(model.timestep.total_seconds() / 3600))
     n_steps = n_verif * dt_verif // timestep_h
+    checkpoint_stride = int(exp.get('checkpoint_stride', 1))
+
+    loss_bases = [b for b, _ in interp_specs]
 
     step_lo = psobs_traj['step_lo'].tolist()
     alpha = psobs_traj['alpha'].tolist()
@@ -821,10 +834,11 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
         return Jt
 
     f_state = input_state
-    decoded_prev = model.decode_state(f_state)   # step 0 = uncorrected background
+    decoded_prev = model.decode_state(f_state, only=loss_bases)   # step 0 = uncorrected background
     for s in range(1, n_steps + 1):
         inj = scaled_increment if s == 1 else None
-        f_state = model.advance(f_state, steps=1, latent_increment=inj)
+        use_ckpt = (checkpoint_stride > 0) and (s % checkpoint_stride == 0)
+        f_state = model.advance(f_state, steps=1, latent_increment=inj, use_checkpoint=use_ckpt)
         if s == 1 and keep_mask is not None:
             # Confine the increment's direct effect to the controlled
             # columns; the rest revert to the uncorrected forecast
@@ -834,7 +848,7 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
             f_state = aifs_model.AIFSState(
                 torch.where(keep_mask, f_state.state, ref_state1.state), f_state.date
             )
-        decoded_cur = model.decode_state(f_state)
+        decoded_cur = model.decode_state(f_state, only=loss_bases)
         for j in slots_by_step.get(s - 1, []):
             a = alpha[j]
             if a == 0.0:

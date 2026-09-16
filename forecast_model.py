@@ -156,9 +156,18 @@ class LatentForecastModel(abc.ABC):
     # ------------------------------------------------------------------
 
     @abc.abstractmethod
-    def decode_state(self, state: ModelState, time_index: int = -1) -> dict[str, torch.Tensor]:
+    def decode_state(
+        self, state: ModelState, time_index: int = -1, only: "list[str] | None" = None
+    ) -> dict[str, torch.Tensor]:
         """Slice one time level into {name: tensor} -- pressure-level
         families as (n_levels, n_points), single-level fields as (n_points,).
+
+        `only`: an optional performance hint -- restrict decoding to just
+        these base names, skipping any others. A backend may ignore it (full
+        decode is always a valid, if less efficient, implementation); AIFS's
+        implements it because its per-step hot loop (compute_loss_4dvar)
+        otherwise decodes ~15-20 families it never reads, `max_epoch x
+        n_steps` times per window.
 
         MUST include, under exactly these canonical keys (the solver core's
         forward operator / QC code reads them unconditionally, regardless of
