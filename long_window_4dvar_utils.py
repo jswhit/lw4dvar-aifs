@@ -259,7 +259,7 @@ def get_verif(exp, model, logger, date_override=None):
     the ps-obs forward operator's orography and the driver's z500 diagnostic).
 
     `date_override` (a '%Y-%m-%dT%H' string) fetches truth at a date other than
-    `exp['date']`. Used for the `control_space: 'latent'` z500 before/after
+    `exp['date']`. Used for the z500 before/after
     diagnostic, whose analysis is valid at `window_start + dt_verif`, not
     `window_start` -- the driver scores it against ERA5 truth fetched there.
     """
@@ -941,6 +941,7 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
 
     lsave = []
     loss_min = 1e19
+    epoch_min = 1
     increment_best = None
 
     # '_loss_latent_' kept (not '_loss_') for continuity with existing
@@ -977,9 +978,10 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
             json.dump(history, f, indent=4)
 
         if loss.item() < loss_min:
-            logger.info('new best optimal (latent)...')
+            logger.info('new best optimal...')
             lsave.append(loss.item())
             loss_min = loss.item()
+            epoch_min = epoch
             increment_best = increment.detach().clone()
         else:
             lsave.append(lsave[-1])
@@ -993,7 +995,7 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
     if increment_best is not None:
         pt_file = exp['path_output'] + exp['date'] + '_latent_increment_' + exp['window_name'] + 'h' + exp['suffix'] + '_' + str(max_epoch) + 'it.pt'
         torch.save({'increment': increment_best, 'latent_scale': latent_scale}, pt_file)
-        logger.info(f'saved best latent increment to {pt_file}')
+        logger.info(f'saved best latent increment (for epoch={epoch_min}) to {pt_file}')
     else:
         logger.warning('no epoch improved on the background -- returning an UNCORRECTED forecast advance')
         lsave = lsave or [float('nan')]
@@ -1175,8 +1177,8 @@ def save_xr_trajectory(model, model_trajectory, olevels, ofile, save=True, start
     `start_date`: the 'time' dim has no coordinate values of its own (just an
     index) -- if given, recorded as a dataset attribute so a caller can tell
     what real date `time=0` corresponds to (needed when the trajectory
-    doesn't start at the nominal window-start date, e.g. control_space:
-    'latent''s shifted analysis -- see save_trajectory_diagnostics).
+    doesn't start at the nominal window-start date
+    -- see save_trajectory_diagnostics).
     """
     ds_new = xarray.Dataset(
         coords={
@@ -1228,8 +1230,8 @@ def save_inputs_nc(exp, model, input_encoded, analysis_state, logger):
     ofile = exp['path_output'] + exp['date'] + '_control_inputs_' + exp['window_name'] + 'h' + exp['suffix'] + '_' + str(max_epoch) + 'it.nc'
     ds_control.to_netcdf(ofile)
 
-    # analysis_state.date may differ from input_encoded.date (control_space:
-    # 'latent' -- see compute_optimal_latent) -- recorded as an attribute
+    # analysis_state.date may differ from input_encoded.date 
+    # recorded as an attribute
     # since this is a single-time snapshot with no 'time' dim of its own.
     ds_optimal = _save_xr_state(model, _state_to_dict(analysis_state), date=str(analysis_state.date))
     ofile = exp['path_output'] + exp['date'] + '_optimal_inputs_' + exp['window_name'] + 'h' + exp['suffix'] + '_' + str(max_epoch) + 'it.nc'
@@ -1276,7 +1278,7 @@ def make_forecasts(exp, model, input_encoded, analysis_state, save_levs, logger)
     ofile = exp['path_output'] + exp['date'] + '_optimal_longforecast_' + exp['window_name'] + 'h' + exp['suffix'] + '_' + str(max_epoch) + 'it.nc'
     # First output is `steps_per_output` (dt_forecast hours) past
     # analysis_state.date, which may itself already be shifted from
-    # input_encoded.date (control_space: 'latent') -- record it rather than
+    # input_encoded.date  -- record it rather than
     # assume the window-start date.
     first_output_date = analysis_state.date + steps_per_output * model.timestep
     _ = save_xr_trajectory(model, outputs, save_levs, ofile, start_date=str(first_output_date))
